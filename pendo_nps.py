@@ -1,11 +1,11 @@
 import os
-import json
-import time
 import requests
 from datetime import datetime, timedelta, timezone
 
 PENDO_API_KEY = os.environ["PENDO_API_KEY"]
 SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
+PENDO_GUIDE_ID = os.environ["PENDO_GUIDE_ID"]
+PENDO_SUB_ID = os.environ["PENDO_SUB_ID"]
 
 PENDO_BASE = "https://app.pendo.io/api/v1"
 HEADERS = {
@@ -14,87 +14,54 @@ HEADERS = {
 }
 
 
-def get_time_range(days=7):
+def date_range(days_ago_start, days_ago_end=0):
     now = datetime.now(timezone.utc)
-    start = now - timedelta(days=days)
-    return int(start.timestamp() * 1000), int(now.timestamp() * 1000)
+    start = (now - timedelta(days=days_ago_start)).strftime("%Y-%m-%d")
+    end = (now - timedelta(days=days_ago_end)).strftime("%Y-%m-%d")
+    return start, end
 
 
-def fetch_nps_responses(start_ms, end_ms):
-    payload = {
-        "response": {
-            "mimeType": "application/json"
-        },
-        "request": {
-            "pipeline": [
-                {
-                    "source": {
-                        "npsResponses": {
-                            "timeSeries": {
-                                "first": start_ms,
-                                "last": end_ms,
-                                "count": 30,
-                                "granularity": "dayRange"
-                            }
-                        }
-                    }
-                }
-            ]
-        }
+def fetch_nps(start_date, end_date, include_responses=False):
+    params = {
+        "startDate": start_date,
+        "endDate": end_date,
+        "period": "dayRange",
     }
+    if include_responses:
+        params["includeResponses"] = "unsorted"
 
-    r = requests.post(
-        f"{PENDO_BASE}/aggregation",
+    r = requests.get(
+        f"{PENDO_BASE}/guide/{PENDO_GUIDE_ID}/nps",
         headers=HEADERS,
-        json=payload,
-        timeout=30
+        params=params,
+        timeout=30,
     )
     r.raise_for_status()
     return r.json()
 
 
 def fetch_prior_nps_score(days=7):
-    """Fetch NPS score for the prior period for trend comparison."""
-    now = datetime.now(timezone.utc)
-    end = now - timedelta(days=days)
-    start = end - timedelta(days=days)
-    start_ms = int(start.timestamp() * 1000)
-    end_ms = int(end.timestamp() * 1000)
-
     try:
-        data = fetch_nps_responses(start_ms, end_ms)
-        results = data.get("results", [])
-        scores = [r["npsRating"] for r in results if "npsRating" in r]
-        if not scores:
-            return None
-        promoters = sum(1 for s in scores if s >= 9)
-        detractors = sum(1 for s in scores if s <= 6)
-        total = len(scores)
-        return round(((promoters - detractors) / total) * 100)
+        start, end = date_range(days_ago_start=days * 2, days_ago_end=days)
+        data = fetch_nps(start, end)
+        return data.get("npsScore")
     except Exception:
         return None
 
 
-def compute_nps(results):
-    scores = [r["npsRating"] for r in results if "npsRating" in r]
-    if not scores:
-        return None, 0, 0, 0, 0
-
-    total = len(scores)
-    promoters = sum(1 for s in scores if s >= 9)
-    passives = sum(1 for s in scores if 7 <= s <= 8)
-    detractors = sum(1 for s in scores if s <= 6)
-    nps = round(((promoters - detractors) / total) * 100)
+def compute_nps(data):
+    nps = data.get("npsScore")
+    total = data.get("numResponses", 0)
+    promoters = data.get("numPromoters", 0)
+    passives = data.get("numNeutral", 0)
+    detractors = data.get("numDetractors", 0)
     return nps, total, promoters, passives, detractors
 
 
-def get_top_comments(results, n=3):
-    """Return top n low-score comments (detractors), then passives, then promoters."""
-    with_comments = [
-        r for r in results
-        if r.get("npsText", "").strip() and "npsRating" in r
-    ]
-    with_comments.sort(key=lambda r: r["npsRating"])
+def get_top_comments(data, n=3):
+    responses = data.get("responses", [])
+    with_comments = [r for r in responses if r.get("npsReason", "").strip()]
+    with_comments.sort(key=lambda r: r.get("npsScore", 10))
     return with_comments[:n]
 
 
@@ -112,8 +79,8 @@ def build_slack_message(nps, total, promoters, passives, detractors, prior_nps, 
 
     comment_blocks = []
     for c in comments:
-        rating = c.get("npsRating", "?")
-        text = c.get("npsText", "").strip()
+        rating = c.get("npsScore", "?")
+        text = c.get("npsReason", "").strip()
         comment_blocks.append({
             "type": "section",
             "text": {
@@ -190,21 +157,21 @@ def send_to_slack(message):
 
 def main():
     print("Fetching Pendo NPS data for last 7 days...")
-    start_ms, end_ms = get_time_range(days=7)
+    start, end = date_range(days_ago_start=7)
 
-    data = fetch_nps_responses(start_ms, end_ms)
-    results = data.get("results", [])
+    data = fetch_nps(start, end, include_responses=True)
 
-    if not results:
+    nps, total, promoters, passives, detractors = compute_nps(data)
+
+    if not total:
         print("No NPS responses found for the last 7 days.")
         return
 
-    nps, total, promoters, passives, detractors = compute_nps(results)
     prior_nps = fetch_prior_nps_score(days=7)
-    comments = get_top_comments(results, n=3)
+    comments = get_top_comments(data, n=3)
 
     print(f"NPS: {nps} | Total: {total} | Promoters: {promoters} | Passives: {passives} | Detractors: {detractors}")
-    if prior_nps:
+    if prior_nps is not None:
         print(f"Prior period NPS: {prior_nps}")
 
     message = build_slack_message(nps, total, promoters, passives, detractors, prior_nps, comments)
