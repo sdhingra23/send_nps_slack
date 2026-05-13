@@ -27,84 +27,13 @@ def date_range(days_ago_start, days_ago_end=0):
     return start, end
 
 
-def fetch_nps(start_date, end_date):
-    first_ms = to_ms(start_date)
-    last_ms = to_ms(end_date)
-    # Calculate count as number of days in range
-    count = max(1, (last_ms - first_ms) // (86400 * 1000) + 1)
-
+def aggregation_post(pipeline):
     payload = {
-        "response": {"location": "request", "mimeType": "application/json"},
-        "requests": [
-            {
-                "name": "NpsResponsesTable",
-                "pipeline": [
-                    {
-                        "source": {
-                            "pollEvents": {
-                                "guideId": PENDO_GUIDE_ID,
-                                "pollId": PENDO_POLL_ID,
-                                "blacklist": "apply"
-                            },
-                            "timeSeries": {
-                                "period": "dayRange",
-                                "first": first_ms,
-                                "count": count
-                            }
-                        }
-                    },
-                    {"identified": "visitorId"},
-                    {"filter": "excluded != true"},
-                    {
-                        "merge": {
-                            "fields": ["visitorId", "accountId"],
-                            "mappings": {"followUpResponses": "responses"},
-                            "pipeline": [
-                                {
-                                    "source": {
-                                        "pollEvents": {
-                                            "guideId": PENDO_GUIDE_ID,
-                                            "pollId": PENDO_FOLLOWUP_POLL_ID,
-                                            "blacklist": "apply"
-                                        },
-                                        "timeSeries": {
-                                            "period": "dayRange",
-                                            "first": first_ms,
-                                            "count": count
-                                        }
-                                    }
-                                },
-                                {"sort": ["browserTime"]},
-                                {"eval": {"responseObj.pollResponse": "pollResponse", "responseObj.browserTime": "browserTime"}},
-                                {"group": {"group": ["visitorId", "accountId"], "fields": [{"responses": {"list": "responseObj"}}]}}
-                            ]
-                        }
-                    },
-                    {"unwind": {"field": "followUpResponses", "keepEmpty": True}},
-                    {"eval": {"followUpResponse": "if (followUpResponses.browserTime >= (browserTime - 500) && followUpResponses.browserTime < (browserTime + 500), followUpResponses.pollResponse, null)"}},
-                    {"group": {"group": ["visitorId", "accountId", "parentAccountId", "pollResponse", "browserTime", "type", "excluded"], "fields": [{"followUpResponse": {"first": "followUpResponse"}}]}},
-                    {"switch": {"responseGroup": {"pollResponse": [{"value": "Detractor", "<": 7}, {"value": "Passive", ">=": 7, "<": 9}, {"value": "Promoter", ">=": 9}]}}},
-                    {
-                        "fork": [
-                            [
-                                {"unwind": {"field": "selectedNpsThemes", "keepEmpty": True}},
-                                {"select": {"t.npsTheme": "if(!isNil(followUpResponse) && isNil(selectedNpsThemes.name), \"noThemeResponses\", selectedNpsThemes.displayName)", "t.themeId": "if(!isNil(followUpResponse) && isNil(selectedNpsThemes.name), \"noThemeResponses\", selectedNpsThemes.name)", "responseGroup": "responseGroup"}},
-                                {"group": {"group": ["t.npsTheme", "t.themeId"], "fields": [{"t.promoters": {"countIf": {"count": None, "if": "responseGroup == `Promoter`"}}}, {"t.detractors": {"countIf": {"count": None, "if": "responseGroup == `Detractor`"}}}, {"t.passives": {"countIf": {"count": None, "if": "responseGroup == `Passive`"}}}, {"responsesCount": {"count": None}}]}},
-                                {"reduce": {"counts": {"list": "t"}, "totalResponsesCount": {"sum": "responsesCount"}}}
-                            ],
-                            [
-                                {"limit": 10000},
-                                {"select": {"visitorId": "visitorId", "browserTime": "browserTime", "pollResponse": "pollResponse", "responseGroup": "responseGroup", "followUpResponse": "followUpResponse", "type": "channel", "excluded": "excluded", "accountId": "accountId"}}
-                            ]
-                        ]
-                    }
-                ]
-            }
-        ]
+        "response": {"mimeType": "application/json"},
+        "request": {"pipeline": pipeline}
     }
-
     r = requests.post(
-        f"{PENDO_BASE}/aggregation/multi-request",
+        f"{PENDO_BASE}/aggregation",
         headers=HEADERS,
         json=payload,
         timeout=30,
@@ -112,30 +41,105 @@ def fetch_nps(start_date, end_date):
     if not r.ok:
         print("Pendo error:", r.status_code, r.text)
         r.raise_for_status()
-    data = r.json()
-    # multi-request endpoint returns messages[0].rows
-    rows = data.get("messages", [{}])[0].get("rows", [])
-    return rows
+    return r.json().get("results", [])
 
 
-def parse_results(rows):
-    summary = {}
-    responses = []
-    for row in rows:
-        if "totalResponsesCount" in row:
-            summary = row
-        elif "responseGroup" in row:
-            responses.append(row)
-    return summary, responses
+def fetch_nps_scores(first_ms, count):
+    """Fetch NPS ratings (poll 1)."""
+    return aggregation_post([
+        {
+            "source": {
+                "pollEvents": {
+                    "guideId": PENDO_GUIDE_ID,
+                    "pollId": PENDO_POLL_ID,
+                    "blacklist": "apply"
+                },
+                "timeSeries": {
+                    "period": "dayRange",
+                    "first": first_ms,
+                    "count": count
+                }
+            }
+        },
+        {"identified": "visitorId"},
+        {"filter": "excluded != true"},
+        {
+            "select": {
+                "visitorId": "visitorId",
+                "accountId": "accountId",
+                "browserTime": "browserTime",
+                "pollResponse": "pollResponse"
+            }
+        }
+    ])
 
 
-def compute_nps(summary, responses):
-    total = summary.get("totalResponsesCount", 0)
-    if not total:
+def fetch_followups(first_ms, count):
+    """Fetch follow-up text responses (poll 2)."""
+    return aggregation_post([
+        {
+            "source": {
+                "pollEvents": {
+                    "guideId": PENDO_GUIDE_ID,
+                    "pollId": PENDO_FOLLOWUP_POLL_ID,
+                    "blacklist": "apply"
+                },
+                "timeSeries": {
+                    "period": "dayRange",
+                    "first": first_ms,
+                    "count": count
+                }
+            }
+        },
+        {"identified": "visitorId"},
+        {
+            "select": {
+                "visitorId": "visitorId",
+                "browserTime": "browserTime",
+                "followUpResponse": "pollResponse"
+            }
+        }
+    ])
+
+
+def fetch_nps(start_date, end_date):
+    first_ms = to_ms(start_date)
+    last_ms = to_ms(end_date)
+    count = max(1, (last_ms - first_ms) // (86400 * 1000) + 1)
+
+    scores = fetch_nps_scores(first_ms, count)
+    followups = fetch_followups(first_ms, count)
+
+    # Build lookup: visitorId -> followUpResponse (match on closest browserTime)
+    followup_map = {}
+    for f in followups:
+        vid = f.get("visitorId")
+        if vid:
+            followup_map[vid] = f.get("followUpResponse", "")
+
+    # Merge follow-ups into scores
+    results = []
+    for s in scores:
+        vid = s.get("visitorId")
+        score = s.get("pollResponse", 0)
+        group = "Promoter" if score >= 9 else ("Passive" if score >= 7 else "Detractor")
+        results.append({
+            "visitorId": vid,
+            "pollResponse": score,
+            "responseGroup": group,
+            "followUpResponse": followup_map.get(vid, "")
+        })
+
+    return results
+
+
+def compute_nps(results):
+    if not results:
         return None, 0, 0, 0, 0
-    promoters = sum(1 for r in responses if r.get("responseGroup") == "Promoter")
-    passives = sum(1 for r in responses if r.get("responseGroup") == "Passive")
-    detractors = sum(1 for r in responses if r.get("responseGroup") == "Detractor")
+    total = len(results)
+    promoters = sum(1 for r in results if r["responseGroup"] == "Promoter")
+    passives = sum(1 for r in results if r["responseGroup"] == "Passive")
+    detractors = sum(1 for r in results if r["responseGroup"] == "Detractor")
     nps = round(((promoters - detractors) / total) * 100)
     return nps, total, promoters, passives, detractors
 
@@ -143,17 +147,16 @@ def compute_nps(summary, responses):
 def fetch_prior_nps_score(days=7):
     try:
         start, end = date_range(days_ago_start=days * 2, days_ago_end=days)
-        rows = fetch_nps(start, end)
-        summary, responses = parse_results(rows)
-        nps, *_ = compute_nps(summary, responses)
+        results = fetch_nps(start, end)
+        nps, *_ = compute_nps(results)
         return nps
     except Exception:
         return None
 
 
-def get_top_comments(responses, n=3):
+def get_top_comments(results, n=3):
     with_comments = [
-        r for r in responses
+        r for r in results
         if r.get("followUpResponse") and str(r["followUpResponse"]).strip()
     ]
     with_comments.sort(key=lambda r: r.get("pollResponse", 10))
@@ -216,26 +219,22 @@ def build_slack_message(nps, total, promoters, passives, detractors, prior_nps, 
 
 def send_to_slack(message):
     r = requests.post(SLACK_WEBHOOK_URL, json=message, timeout=10)
-    if not r.ok:
-        print("Pendo error:", r.status_code, r.text)
-        r.raise_for_status()
+    r.raise_for_status()
     print("✅ Slack message sent.")
 
 
 def main():
     print("Fetching Pendo NPS data for last 7 days...")
     start, end = date_range(days_ago_start=7)
-    rows = fetch_nps(start, end)
+    results = fetch_nps(start, end)
 
-    summary, responses = parse_results(rows)
-    nps, total, promoters, passives, detractors = compute_nps(summary, responses)
-
+    nps, total, promoters, passives, detractors = compute_nps(results)
     if not total:
         print("No NPS responses found for the last 7 days.")
         return
 
     prior_nps = fetch_prior_nps_score(days=7)
-    comments = get_top_comments(responses, n=3)
+    comments = get_top_comments(results, n=3)
 
     print(f"NPS: {nps} | Total: {total} | Promoters: {promoters} | Passives: {passives} | Detractors: {detractors}")
     if prior_nps is not None:
