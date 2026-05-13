@@ -6,6 +6,7 @@ PENDO_API_KEY = os.environ["PENDO_API_KEY"]
 SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
 PENDO_GUIDE_ID = os.environ["PENDO_GUIDE_ID"]
 PENDO_POLL_ID = os.environ["PENDO_POLL_ID"]
+PENDO_FOLLOWUP_POLL_ID = os.environ["PENDO_FOLLOWUP_POLL_ID"]
 
 PENDO_BASE = "https://app.pendo.io/api/v1"
 HEADERS = {
@@ -27,27 +28,79 @@ def date_range(days_ago_start, days_ago_end=0):
 
 
 def fetch_nps(start_date, end_date):
+    first_ms = to_ms(start_date)
+    last_ms = to_ms(end_date)
+    # Calculate count as number of days in range
+    count = max(1, (last_ms - first_ms) // (86400 * 1000) + 1)
+
     payload = {
-        "response": {"mimeType": "application/json"},
-        "request": {
-            "requestId": "NpsResponsesTable",
-            "pipeline": [
-                {
-                    "source": {
-                        "npsResponses": {
-                            "guideId": PENDO_GUIDE_ID,
-                            "pollId": PENDO_POLL_ID
-                        },
-                        "timeSeries": {
-                            "period": "dayRange",
-                            "first": to_ms(start_date),
-                            "last": to_ms(end_date),
-                            "count": -1
+        "response": {"location": "request", "mimeType": "application/json"},
+        "requests": [
+            {
+                "name": "NpsResponsesTable",
+                "pipeline": [
+                    {
+                        "source": {
+                            "pollEvents": {
+                                "guideId": PENDO_GUIDE_ID,
+                                "pollId": PENDO_POLL_ID,
+                                "blacklist": "apply"
+                            },
+                            "timeSeries": {
+                                "period": "dayRange",
+                                "first": first_ms,
+                                "count": count
+                            }
                         }
+                    },
+                    {"identified": "visitorId"},
+                    {"filter": "excluded != true"},
+                    {
+                        "merge": {
+                            "fields": ["visitorId", "accountId"],
+                            "mappings": {"followUpResponses": "responses"},
+                            "pipeline": [
+                                {
+                                    "source": {
+                                        "pollEvents": {
+                                            "guideId": PENDO_GUIDE_ID,
+                                            "pollId": PENDO_FOLLOWUP_POLL_ID,
+                                            "blacklist": "apply"
+                                        },
+                                        "timeSeries": {
+                                            "period": "dayRange",
+                                            "first": first_ms,
+                                            "count": count
+                                        }
+                                    }
+                                },
+                                {"sort": ["browserTime"]},
+                                {"eval": {"responseObj.pollResponse": "pollResponse", "responseObj.browserTime": "browserTime"}},
+                                {"group": {"group": ["visitorId", "accountId"], "fields": [{"responses": {"list": "responseObj"}}]}}
+                            ]
+                        }
+                    },
+                    {"unwind": {"field": "followUpResponses", "keepEmpty": True}},
+                    {"eval": {"followUpResponse": "if (followUpResponses.browserTime >= (browserTime - 500) && followUpResponses.browserTime < (browserTime + 500), followUpResponses.pollResponse, null)"}},
+                    {"group": {"group": ["visitorId", "accountId", "parentAccountId", "pollResponse", "browserTime", "type", "excluded"], "fields": [{"followUpResponse": {"first": "followUpResponse"}}]}},
+                    {"switch": {"responseGroup": {"pollResponse": [{"value": "Detractor", "<": 7}, {"value": "Passive", ">=": 7, "<": 9}, {"value": "Promoter", ">=": 9}]}}},
+                    {
+                        "fork": [
+                            [
+                                {"unwind": {"field": "selectedNpsThemes", "keepEmpty": True}},
+                                {"select": {"t.npsTheme": "if(!isNil(followUpResponse) && isNil(selectedNpsThemes.name), \"noThemeResponses\", selectedNpsThemes.displayName)", "t.themeId": "if(!isNil(followUpResponse) && isNil(selectedNpsThemes.name), \"noThemeResponses\", selectedNpsThemes.name)", "responseGroup": "responseGroup"}},
+                                {"group": {"group": ["t.npsTheme", "t.themeId"], "fields": [{"t.promoters": {"countIf": {"count": None, "if": "responseGroup == `Promoter`"}}}, {"t.detractors": {"countIf": {"count": None, "if": "responseGroup == `Detractor`"}}}, {"t.passives": {"countIf": {"count": None, "if": "responseGroup == `Passive`"}}}, {"responsesCount": {"count": None}}]}},
+                                {"reduce": {"counts": {"list": "t"}, "totalResponsesCount": {"sum": "responsesCount"}}}
+                            ],
+                            [
+                                {"limit": 10000},
+                                {"select": {"visitorId": "visitorId", "browserTime": "browserTime", "pollResponse": "pollResponse", "responseGroup": "responseGroup", "followUpResponse": "followUpResponse", "type": "channel", "excluded": "excluded", "accountId": "accountId"}}
+                            ]
+                        ]
                     }
-                }
-            ]
-        }
+                ]
+            }
+        ]
     }
 
     r = requests.post(
@@ -62,7 +115,6 @@ def fetch_nps(start_date, end_date):
 
 
 def parse_results(rows):
-    # First row is the summary, remaining rows are individual responses
     summary = {}
     responses = []
     for row in rows:
@@ -98,7 +150,7 @@ def fetch_prior_nps_score(days=7):
 def get_top_comments(responses, n=3):
     with_comments = [
         r for r in responses
-        if r.get("followUpResponse") and r["followUpResponse"].strip()
+        if r.get("followUpResponse") and str(r["followUpResponse"]).strip()
     ]
     with_comments.sort(key=lambda r: r.get("pollResponse", 10))
     return with_comments[:n]
@@ -119,7 +171,7 @@ def build_slack_message(nps, total, promoters, passives, detractors, prior_nps, 
     comment_blocks = []
     for c in comments:
         rating = c.get("pollResponse", "?")
-        text = c.get("followUpResponse", "").strip()
+        text = str(c.get("followUpResponse", "")).strip()
         comment_blocks.append({
             "type": "section",
             "text": {"type": "mrkdwn", "text": f"> _{text}_\n> Score: *{rating}/10*"}
