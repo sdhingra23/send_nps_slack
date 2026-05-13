@@ -31,8 +31,8 @@ def fetch_nps_responses(start_ms, end_ms):
                     "source": {
                         "npsResponses": {
                             "timeSeries": {
-                                "first": f"{start_ms}",
-                                "last": f"{end_ms}",
+                                "first": start_ms,
+                                "last": end_ms,
                                 "count": 30,
                                 "granularity": "dayRange"
                             }
