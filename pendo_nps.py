@@ -109,7 +109,9 @@ def fetch_nps(start_date, end_date):
         json=payload,
         timeout=30,
     )
-    r.raise_for_status()
+    if not r.ok:
+        print("Pendo error:", r.status_code, r.text)
+        r.raise_for_status()
     rows = r.json().get("results", [])
     return rows
 
@@ -212,7 +214,9 @@ def build_slack_message(nps, total, promoters, passives, detractors, prior_nps, 
 
 def send_to_slack(message):
     r = requests.post(SLACK_WEBHOOK_URL, json=message, timeout=10)
-    r.raise_for_status()
+    if not r.ok:
+        print("Pendo error:", r.status_code, r.text)
+        r.raise_for_status()
     print("✅ Slack message sent.")
 
 
