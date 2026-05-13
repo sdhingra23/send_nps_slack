@@ -25,4 +25,6 @@ jobs:
         env:
           PENDO_API_KEY: ${{ secrets.PENDO_API_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          PENDO_GUIDE_ID: ${{ secrets.PENDO_GUIDE_ID }}
+          PENDO_SUB_ID: ${{ secrets.PENDO_SUB_ID }}
         run: python pendo_nps.py
