@@ -104,7 +104,7 @@ def fetch_nps(start_date, end_date):
     }
 
     r = requests.post(
-        f"{PENDO_BASE}/aggregation",
+        f"{PENDO_BASE}/aggregation/multi-request",
         headers=HEADERS,
         json=payload,
         timeout=30,
@@ -112,7 +112,9 @@ def fetch_nps(start_date, end_date):
     if not r.ok:
         print("Pendo error:", r.status_code, r.text)
         r.raise_for_status()
-    rows = r.json().get("results", [])
+    data = r.json()
+    # multi-request endpoint returns messages[0].rows
+    rows = data.get("messages", [{}])[0].get("rows", [])
     return rows
 
 
