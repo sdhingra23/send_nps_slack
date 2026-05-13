@@ -28,4 +28,5 @@ jobs:
           PENDO_GUIDE_ID: ${{ secrets.PENDO_GUIDE_ID }}
           PENDO_SUB_ID: ${{ secrets.PENDO_SUB_ID }}
           PENDO_POLL_ID: ${{ secrets.PENDO_POLL_ID }}
+          PENDO_FOLLOWUP_POLL_ID: ${{ secrets.PENDO_FOLLOWUP_POLL_ID }}
         run: python pendo_nps.py
