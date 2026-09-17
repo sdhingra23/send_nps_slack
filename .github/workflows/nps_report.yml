@@ -2,7 +2,7 @@ name: Weekly NPS Report
 
 on:
   schedule:
-    - cron: "0 9 * * 1"  # Every Monday at 9am UTC
+    - cron: "17 9 * * 1"  # Every Monday at ~9:17am UTC (off top-of-hour to avoid GitHub Actions scheduler congestion)
   workflow_dispatch:      # Allows manual trigger from GitHub UI
 
 jobs:

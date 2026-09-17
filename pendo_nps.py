@@ -1,4 +1,5 @@
 import os
+import time
 import requests
 from datetime import datetime, timedelta, timezone
 
@@ -27,21 +28,32 @@ def date_range(days_ago_start, days_ago_end=0):
     return start, end
 
 
-def aggregation_post(pipeline):
+def aggregation_post(pipeline, max_retries=3, timeout=60):
     payload = {
         "response": {"mimeType": "application/json"},
         "request": {"pipeline": pipeline}
     }
-    r = requests.post(
-        f"{PENDO_BASE}/aggregation",
-        headers=HEADERS,
-        json=payload,
-        timeout=30,
-    )
-    if not r.ok:
-        print("Pendo error:", r.status_code, r.text)
-        r.raise_for_status()
-    return r.json().get("results", [])
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.post(
+                f"{PENDO_BASE}/aggregation",
+                headers=HEADERS,
+                json=payload,
+                timeout=timeout,
+            )
+            if not r.ok:
+                print("Pendo error:", r.status_code, r.text)
+                r.raise_for_status()
+            return r.json().get("results", [])
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                wait = 2 ** attempt  # 2s, 4s, ...
+                print(f"Pendo request failed ({exc!r}), retrying in {wait}s "
+                      f"(attempt {attempt}/{max_retries})...")
+                time.sleep(wait)
+    raise last_exc
 
 
 def fetch_nps_scores(first_ms, count):
